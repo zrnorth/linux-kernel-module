@@ -99,7 +99,6 @@ static void for_each_open_file(struct task_struct *task,
 						osprd_info_t *user_data),
 			       osprd_info_t *user_data);
 
-
 /*
  * osprd_process_request(d, req)
  *   Called when the user reads or writes a sector.
@@ -119,10 +118,38 @@ static void osprd_process_request(osprd_info_t *d, struct request *req)
 	// Read about 'struct request' in <linux/blkdev.h>.
 	// Consider the 'req->sector', 'req->current_nr_sectors', and
 	// 'req->buffer' members, and the rq_data_dir() function.
+    //
+    // req->sector == Target location
+    // req->current_nr_sectors == Number of sectors in first segment of request
+    // req->buffer == Map of first segment
+    // rq_data_dir() == macro to get data direction(READ or WRITE)
 
 	// Your code here.
-	eprintk("Should process request...\n");
+    int sector = (int)(req->sector);
+    uint8_t *ptr = d->data + (sector * SECTOR_SIZE);
+    int size = (int)(req->current_nr_sectors * SECTOR_SIZE);
+    // DEBUG: just prints that request was received
+    printk("request received: sector %i, size %i\n", sector, size);
 
+    //check that the ptr didn't go "off the end"
+    if (ptr + size > d->data + SECTOR_SIZE*nsectors)
+    {
+        printk(KERN_WARNING "request past the end of the device!\n");
+        return;
+    }
+
+    //just copy the memory from the osprd_info struct to the request (it's a read)
+    switch (rq_data_dir(req))
+    {
+        case READ:
+            memcpy(req->buffer, ptr, size);
+            break;
+        case WRITE:
+            memcpy(ptr, req->buffer, size);
+            break;
+        default: //error
+            break;
+    }
 	end_request(req, 1);
 }
 
