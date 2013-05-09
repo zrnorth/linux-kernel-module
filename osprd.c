@@ -64,6 +64,8 @@ typedef struct osprd_info {
     //added
     unsigned int q_size; // size of the the queue
     unsigned int write_lock; //only 1
+    int write_lock_owner; //keeps track of the pid with the write lock
+
     unsigned int read_locks; //unlimited
 
 
@@ -190,14 +192,17 @@ static int osprd_close_last(struct inode *inode, struct file *filp)
         {
             osp_spin_lock(&d->mutex);
             if (d->write_lock)
+            {
                 d->write_lock = 0;
+                d->write_lock_owner = -1;
+            }
             wake_up_all(&d->blockq);
             osp_spin_unlock(&d->mutex);
         }
         else
         {
             osp_spin_lock(&d->mutex);
-            if (d->read_locks && filp->f_flags & F_OSPRD_LOCKED)
+            if (d->read_locks && (filp->f_flags & F_OSPRD_LOCKED))
                 d->read_locks--;
             if (!d->read_locks) //if this was the last lock to go
                 wake_up_all(&d->blockq);
@@ -226,6 +231,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 {
 	osprd_info_t *d = file2osprd(filp);	// device info
 	int r = 0;			// return value: initially 0
+    DEFINE_WAIT(wait); //using the low level stuff
 
 	// is file open for writing?
 	int filp_writable = (filp->f_mode & FMODE_WRITE) != 0;
@@ -280,18 +286,18 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 
             if (d->q_size > 0) //if another proc is waiting, give control to "front of line"
             {
-                printk("another process waiting...\n");
                 if (!d->write_lock && !d->read_locks) // no locks except us
                     wake_up_all(&d->blockq); 
                 d->q_size++; //add to back of queue
-                wait_event_interruptible(d->blockq, (d->write_lock == 0 && d->read_locks == 0));
+                prepare_to_wait_exclusive(&d->blockq, &wait, TASK_INTERRUPTIBLE);
                 // add to write queue
                 osp_spin_unlock(&d->mutex);
                 schedule(); //go to sleep until wake_up_all wakes us
 
                 //wake up
                 osp_spin_lock(&d->mutex);
-                //unsure if call finish_wait here?
+                finish_wait(&d->blockq, &wait); //delete from queue
+
                 d->q_size--;
                 //check that wasn't interrupted
                 if (signal_pending(current))
@@ -300,34 +306,77 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
                     return -ERESTARTSYS;
                 }
             }
-            // at "front of line" and no one is reading / writing.
-            d->write_lock = 1;
-            filp->f_flags |= F_OSPRD_LOCKED;
-            osp_spin_unlock(&d->mutex);
-        }
-        else //we want a read lock
-        {
-            osp_spin_lock(&d->mutex);
-            if (d->q_size > 0)
+            // at "front of line." Now check that no readers / writers
+            while (d->write_lock || d->read_locks)
             {
-                printk("another process waiting...\n");
-                if (!d->write_lock && !d->read_locks) //no locks, wake em up
-                    wake_up_all(&d->blockq);
+                //if the lock is held just go back to back of line.
+                prepare_to_wait_exclusive(&d->blockq, &wait, TASK_INTERRUPTIBLE);
                 d->q_size++;
-                wait_event_interruptible(d->blockq, (d->write_lock == 0)); //want read
                 osp_spin_unlock(&d->mutex);
                 schedule();
 
-                //on wake up
+                //wake up
                 osp_spin_lock(&d->mutex);
+                finish_wait(&d->blockq, &wait);
                 d->q_size--;
                 if (signal_pending(current))
                 {
                     osp_spin_unlock(&d->mutex);
                     return -ERESTARTSYS;
                 }
-            } 
-            //we are at the front of the line and no one is writing.
+            }
+            //when this breaks we can get the lock.
+            d->write_lock = 1;
+            d->write_lock_owner = current->pid;
+                
+            filp->f_flags |= F_OSPRD_LOCKED;
+            osp_spin_unlock(&d->mutex);
+        }
+        else //we want a read lock
+        {
+            osp_spin_lock(&d->mutex);
+            if (d->q_size > 0) //if another proc is waiting, give control to "front of line"
+            {
+                if (!d->write_lock && !d->read_locks) // no locks except us
+                    wake_up_all(&d->blockq); 
+                d->q_size++; //add to back of queue
+                prepare_to_wait_exclusive(&d->blockq, &wait, TASK_INTERRUPTIBLE);
+                // add to write queue
+                osp_spin_unlock(&d->mutex);
+                schedule(); //go to sleep until wake_up_all wakes us
+
+                //wake up
+                osp_spin_lock(&d->mutex);
+                finish_wait(&d->blockq, &wait); //delete from queue
+
+                d->q_size--;
+                //check that wasn't interrupted
+                if (signal_pending(current))
+                {
+                    osp_spin_unlock(&d->mutex);
+                    return -ERESTARTSYS;
+                }
+            }
+            // at "front of line." Now check that no writers (readers ok)
+            while (d->write_lock)
+            {
+                //if the lock is held just go back to back of line.
+                prepare_to_wait_exclusive(&d->blockq, &wait, TASK_INTERRUPTIBLE);
+                d->q_size++;
+                osp_spin_unlock(&d->mutex);
+                schedule();
+
+                //wake up
+                osp_spin_lock(&d->mutex);
+                finish_wait(&d->blockq, &wait);
+                d->q_size--;
+                if (signal_pending(current))
+                {
+                    osp_spin_unlock(&d->mutex);
+                    return -ERESTARTSYS;
+                }
+            }
+            //when this breaks we can get the lock.
             d->read_locks++;
             filp->f_flags |= F_OSPRD_LOCKED;
             osp_spin_unlock(&d->mutex);
@@ -356,6 +405,7 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
             {
                 //get the write lock
                 d->write_lock = 1;
+                d->write_lock_owner = current->pid;
                 filp->f_flags |= F_OSPRD_LOCKED;
                 osp_spin_unlock(&d->mutex);
             }
@@ -387,12 +437,14 @@ int osprd_ioctl(struct inode *inode, struct file *filp,
 		// Your code here (instead of the next line).
         if (!(filp->f_flags & F_OSPRD_LOCKED))
             return -EINVAL; //the file isn't even locked yadingus
+        //else
 
-        filp->f_flags &= !F_OSPRD_LOCKED; //unlock flag
+        filp->f_flags &= ~F_OSPRD_LOCKED; //unlock flag
         osp_spin_lock(&d->mutex);
         if (filp_writable) //had a write lock
         {
             d->write_lock = 0; //release the lock
+            d->write_lock_owner = -1;
             wake_up_all(&d->blockq); //wake up the queue and get next
         } 
         else //read lock
@@ -416,7 +468,11 @@ static void osprd_setup(osprd_info_t *d)
 	init_waitqueue_head(&d->blockq);
 	osp_spin_lock_init(&d->mutex);
 	d->ticket_head = d->ticket_tail = 0;
+
 	/* Add code here if you add fields to osprd_info_t. */
+    d->read_locks = 0;
+    d->write_lock = 0;
+    d->write_lock_owner = -1;
 }
 
 
